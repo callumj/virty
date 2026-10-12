@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""CLI adapter. It never accesses Keychain or receives a secret value."""
+import argparse
+import base64
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+from vm_registry import Registry, private_directory, valid_name
+
+
+def call(request, home=None, timeout=90):
+    home = Path(home or os.environ.get("VIRTY_HOME", ROOT / "runtime/vm"))
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout)
+        connection.connect(str(home / "control.sock"))
+        connection.sendall(json.dumps(request).encode() + b"\n")
+        data = bytearray()
+        while len(data) <= 16 * 1024 * 1024:
+            part = connection.recv(65536)
+            if not part:
+                break
+            data.extend(part)
+            if b"\n" in part:
+                break
+        if len(data) > 16 * 1024 * 1024:
+            raise ValueError("Manager response exceeds the 16 MiB limit.")
+        return json.loads(data)
+
+
+def write_screenshot(filename, image):
+    # Resolve only the parent. Atomically replacing the final path gives it a
+    # new private inode, including when the old entry is a symlink or hard link.
+    requested = Path(filename).expanduser()
+    output = requested.parent.resolve() / requested.name
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".virty-screenshot-", dir=output.parent)
+    try:
+        with os.fdopen(fd, "wb") as file:
+            os.fchmod(file.fileno(), 0o600)
+            file.write(image)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, output)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+    return output
+
+
+def selected_vm(args):
+    if args.vm:
+        name, entry = Registry().entry(args.vm)
+        return Path(entry["home"]), entry["id"], name
+    if args.home or os.environ.get("VIRTY_HOME"):
+        return Path(args.home or os.environ["VIRTY_HOME"]).expanduser().resolve(), None, None
+    registry = Registry()
+    if registry.read()["default"]:
+        name, entry = registry.entry()
+        return Path(entry["home"]), entry["id"], name
+    return ROOT / "runtime/vm", None, None
+
+
+def list_vms(directory=None):
+    registry = Registry(directory)
+    data = registry.read()
+    def inspect(item):
+        name, entry = item
+        row = {"name": name, "vmID": entry["id"], "guestOS": entry["guestOS"], "home": entry["home"],
+               "default": data["default"] == name, "enabled": entry["enabled"], "autostart": entry["autostart"]}
+        try:
+            registry.entry(name)
+            result = call({"command": "status", "vmID": entry["id"]}, entry["home"], timeout=2)
+            if not result.get("ok") or result.get("vmID") != entry["id"]:
+                raise ValueError("VM identity check failed.")
+            row.update(state=result["state"], inputBusy=result["inputBusy"], consoleVisible=result.get("consoleVisible", False))
+        except OSError:
+            row["state"] = "offline"
+        except (ValueError, KeyError) as error:
+            row.update(state="unavailable", error=str(error))
+        return row
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return {"ok": True, "vms": list(pool.map(inspect, sorted(data["vms"].items())))}
+
+
+def wait_disabled(entry):
+    deadline = time.monotonic() + 25
+    while time.monotonic() < deadline:
+        try:
+            call({"command": "status", "vmID": entry["id"]}, entry["home"], timeout=1)
+        except (OSError, ValueError):
+            # Also wait for the supervisor to release its worker lock.
+            import fcntl
+            descriptors = []
+            try:
+                for filename in ("service.lock", "manager.lock"):
+                    fd = os.open(Path(entry["home"]) / filename, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                    descriptors.append(fd)
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                pass
+            finally:
+                for fd in descriptors:
+                    os.close(fd)
+        time.sleep(0.1)
+    raise ValueError("VM worker has not stopped; stop any foreground manager before continuing.")
+
+
+def create_vm(args):
+    valid_name(args.name)
+    registry = Registry()
+    if args.name in registry.read()["vms"]:
+        raise ValueError("VM name already exists.")
+    if not args.image and not (args.os == "linux" and args.disk):
+        raise ValueError("Supply --image (macOS IPSW or ARM64 Linux installer ISO), or --disk for an installed Linux raw EFI disk.")
+    image = Path(args.image).expanduser().resolve(strict=True) if args.image else None
+    disk = Path(args.disk).expanduser().resolve(strict=True) if args.disk else None
+    if args.os == "macos" and disk:
+        raise ValueError("--disk import is supported for Linux only.")
+    if args.setup_assistant and args.os != "macos":
+        raise ValueError("--setup-assistant applies to macOS only; Linux already uses guest-managed setup.")
+    subprocess.run([str(ROOT / "scripts/build.sh")], check=True)
+    subprocess.run([str(ROOT / "bin/virty-secrets"), "init"], check=True)
+    home = ROOT / "runtime/vms" / str(uuid.uuid4()).upper()
+    private_directory(home)
+    executable = (ROOT / ".build/Virty.app/Contents/MacOS/virty-manager").resolve(strict=True)
+    env = {**os.environ, "VIRTY_HOME": str(home)}
+    if args.os == "macos":
+        creation = [str(executable), "create", str(image), "broker"]
+        if args.setup_assistant:
+            creation.append("--setup-assistant")
+        subprocess.run(creation, env=env, check=True)
+        subprocess.run([str(executable), "install", str(image)], env=env, check=True)
+    else:
+        subprocess.run([str(executable), "create-linux", str(image) if image else "-", str(disk) if disk else "-",
+                        str(args.cpus), str(args.memory_gib), str(args.disk_gib)], env=env, check=True)
+    vm_id = registry.register(args.name, home, autostart=not args.no_autostart)
+    return {"ok": True, "name": args.name, "vmID": vm_id, "guestOS": args.os, "home": str(home)}
+
+
+def administration(args):
+    registry = Registry()
+    if args.command == "list":
+        return list_vms()
+    if args.command == "create":
+        return create_vm(args)
+    if args.command == "register":
+        return {"ok": True, "vmID": registry.register(args.name, args.runtime, not args.no_autostart), "name": args.name}
+    if args.command == "rename":
+        with registry.administer(args.name):
+            registry.rename(args.name, args.new_name)
+    elif args.command == "default":
+        registry.set_default(args.name)
+    elif args.command in ("enable", "disable", "unregister"):
+        with registry.administer(args.name) as (_, entry):
+            registry.set_policy(args.name, enabled=args.command == "enable")
+            if args.command != "enable":
+                wait_disabled(entry)
+            if args.command == "unregister":
+                registry.unregister(args.name)
+    elif args.command == "autostart":
+        with registry.administer(args.name):
+            registry.set_policy(args.name, autostart=args.policy == "on")
+    return {"ok": True, "name": args.name, "command": args.command}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Manage named macOS and ARM64 Linux VMs")
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument("--home", help="Explicit VM runtime directory (bypass the registry)")
+    selector.add_argument("--vm", help="Named VM (default: the registry's default VM)")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("mcp", help="Start the local stdio MCP server (see virty-mcp --help)")
+    commands.add_parser("list")
+    create = commands.add_parser("create")
+    create.add_argument("name")
+    create.add_argument("--os", choices=("macos", "linux"), required=True)
+    create.add_argument("--image", help="macOS IPSW or ARM64 Linux installer ISO")
+    create.add_argument("--disk", help="Installed ARM64 Linux raw EFI disk to copy")
+    create.add_argument("--setup-assistant", action="store_true", help="macOS: keep Apple's normal Setup Assistant for account creation and Apple Account sign-in")
+    create.add_argument("--cpus", type=int, default=2, help="Linux CPUs (default: 2)")
+    create.add_argument("--memory-gib", type=int, default=2, help="Linux RAM (default: 2 GiB)")
+    create.add_argument("--disk-gib", type=int, default=16, help="Linux blank disk size (default: 16 GiB)")
+    create.add_argument("--no-autostart", action="store_true")
+    register = commands.add_parser("register")
+    register.add_argument("name")
+    register.add_argument("--home", dest="runtime", required=True)
+    register.add_argument("--no-autostart", action="store_true")
+    rename = commands.add_parser("rename")
+    rename.add_argument("name")
+    rename.add_argument("new_name")
+    for command in ("default", "enable", "disable", "unregister"):
+        commands.add_parser(command).add_argument("name")
+    policy = commands.add_parser("autostart")
+    policy.add_argument("name")
+    policy.add_argument("policy", choices=("on", "off"))
+    commands.add_parser("eject", help="Stop and restart this VM's worker without its Linux installer media")
+    snapshot = commands.add_parser("snapshot", help="Create/list/restore/delete stopped-VM checkpoints including managed secrets")
+    snapshots = snapshot.add_subparsers(dest="snapshot_command", required=True)
+    snapshots.add_parser("list", help="List this VM's checkpoints")
+    save = snapshots.add_parser("create", help="Checkpoint this stopped VM; installer must be detached")
+    save.add_argument("label", help="Unique lowercase checkpoint label, e.g. before-upgrade")
+    for operation in ("restore", "delete"):
+        snapshots.add_parser(operation, help="Roll back this stopped VM" if operation == "restore" else "Permanently remove one checkpoint and its saved secret aliases").add_argument("snapshot", help="Checkpoint label or uppercase snapshot UUID")
+    snapshots.add_parser("recover", help="Recover interrupted snapshot maintenance; leaves guest stopped")
+    clone = commands.add_parser("clone", help="Copy this stopped VM into a new named VM with independent hardware identity and secret aliases")
+    clone.add_argument("new_name")
+    clone.add_argument("--snapshot", help="Clone a checkpoint instead of current state; source guest may be running")
+    for name in ("status", "start", "quit", "show", "hide", "cancel"):
+        commands.add_parser(name)
+    stop = commands.add_parser("stop")
+    stop.add_argument("--force", action="store_true", help="Power off this disposable VM immediately")
+    operation = commands.add_parser("operation")
+    operation.add_argument("--request-id", required=True)
+    screenshot = commands.add_parser("screenshot")
+    screenshot.add_argument("--output", required=True)
+    click = commands.add_parser("click")
+    click.add_argument("--x", required=True, type=int)
+    click.add_argument("--y", required=True, type=int)
+    click.add_argument("--generation")
+    scroll = commands.add_parser("scroll", help="Send vertical wheel input at a guest screenshot coordinate")
+    scroll.add_argument("--x", required=True, type=int, help="Horizontal guest pixel coordinate")
+    scroll.add_argument("--y", required=True, type=int, help="Vertical guest pixel coordinate")
+    scroll.add_argument("--delta-y", required=True, type=int, help="Nonzero wheel steps, -10 to 10; positive downward input, negative upward. Guest natural scrolling may reverse direction")
+    scroll.add_argument("--generation", required=True, help="Generation from a recent screenshot")
+    key = commands.add_parser("key")
+    key.add_argument("--chord", required=True, help="e.g. return, cmd+l, ctrl+cmd+q, home, end, pageup, pagedown")
+    key.add_argument("--generation")
+    text = commands.add_parser("type-text")
+    text.add_argument("--text", required=True, help="Public text only; never pass a password here")
+    secret = commands.add_parser("type-secret")
+    secret.add_argument("--alias", default="vm-login")
+    for sub in (text, secret):
+        sub.add_argument("--generation")
+        sub.add_argument("--delay-ms", type=int, default=80)
+        sub.add_argument("--request-id", default=None, help="Reuse an ID only to inspect/retry the same operation")
+    args = parser.parse_args()
+    if args.command == "mcp":
+        if args.vm or args.home:
+            parser.error("MCP manages the named fleet; do not supply --vm or --home.")
+        os.execv(str(ROOT / "bin/virty-mcp"), [str(ROOT / "bin/virty-mcp")])
+    try:
+        if args.command in ("list", "create", "register", "rename", "default", "enable", "disable", "unregister", "autostart"):
+            print(json.dumps(administration(args), sort_keys=True))
+            return 0
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        print(json.dumps({"ok": False, "error": str(error)}))
+        return 1
+    request = {"command": args.command}
+    if args.command == "stop":
+        request["force"] = args.force
+    for name in ("x", "y", "generation", "chord", "text", "alias"):
+        value = getattr(args, name, None)
+        if value is not None:
+            request[name] = value
+    if args.command == "scroll":
+        request.update(deltaY=args.delta_y)
+    if args.command in ("type-text", "type-secret"):
+        request["delayMs"] = args.delay_ms
+        request["requestId"] = args.request_id or str(uuid.uuid4())
+        # Make the retry ID visible before delivery, including a lost response.
+        print(json.dumps({"requestId": request["requestId"]}), file=sys.stderr)
+    elif args.command == "operation":
+        request["requestId"] = args.request_id
+    try:
+        home, vm_id, name = selected_vm(args)
+        if args.command in ("snapshot", "clone"):
+            if not name:
+                raise ValueError("Snapshots and cloning require a registered named VM.")
+            import vm_snapshots
+            if args.command == "clone":
+                result = vm_snapshots.clone(name, args.new_name, args.snapshot, vm_id)
+            elif args.snapshot_command == "create":
+                result = vm_snapshots.create(name, args.label, vm_id)
+            else:
+                function = getattr(vm_snapshots, "listing" if args.snapshot_command == "list" else args.snapshot_command)
+                result = function(name, *([args.snapshot] if args.snapshot_command in ("restore", "delete") else []), expected_id=vm_id)
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        if args.command == "eject":
+            if not name:
+                raise ValueError("Installer ejection needs a registered named VM.")
+            subprocess.run([sys.executable, str(ROOT / "scripts/service.py"), "eject", "--vm", name], check=True)
+            return 0
+        if vm_id:
+            request["vmID"] = vm_id
+        result = call(request, home)
+        if args.command == "screenshot" and result.get("ok"):
+            image = base64.b64decode(result.pop("png"), validate=True)
+            output = write_screenshot(args.output, image)
+            result["output"] = str(output)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result.get("ok") else 1
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        print(json.dumps({"ok": False, "error": str(error)}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

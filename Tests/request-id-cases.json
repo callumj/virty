@@ -1,0 +1,62 @@
+[
+  {
+    "value": "",
+    "valid": false
+  },
+  {
+    "value": "a",
+    "valid": true
+  },
+  {
+    "value": "0",
+    "valid": true
+  },
+  {
+    "value": "-",
+    "valid": true
+  },
+  {
+    "value": "Task-123",
+    "valid": true
+  },
+  {
+    "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "valid": true
+  },
+  {
+    "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "valid": false
+  },
+  {
+    "value": "task_1",
+    "valid": false
+  },
+  {
+    "value": "é",
+    "valid": false
+  },
+  {
+    "value": "中",
+    "valid": false
+  },
+  {
+    "value": "fullwidth-１",
+    "valid": false
+  },
+  {
+    "value": "task.1",
+    "valid": false
+  },
+  {
+    "value": "task 1",
+    "valid": false
+  },
+  {
+    "value": "task\n",
+    "valid": false
+  },
+  {
+    "value": "task\u0000",
+    "valid": false
+  }
+]
